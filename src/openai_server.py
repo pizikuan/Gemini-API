@@ -1,9 +1,12 @@
 import os
 import sys
+import time
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 from dotenv import load_dotenv
+import json
 
 # Ensure local gemini_webapi is used
 sys.path.insert(
@@ -46,7 +49,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str = "gemini-3.0-pro"
-    messages: list[ChatMessage]
+    messages: list[dict]
     max_tokens: int | None = None
     temperature: float | None = None
     stream: bool = False  # For simplicity, not implementing streaming
@@ -58,12 +61,31 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: str = "stop"
 
 
+class UsageInfo(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
 class ChatCompletionResponse(BaseModel):
     id: str = "chatcmpl-gemini"
     object: str = "chat.completion"
     created: int = 0
     model: str
     choices: list[ChatCompletionChoice]
+    usage: UsageInfo = UsageInfo()
+
+
+class ModelInfo(BaseModel):
+    id: str
+    object: str = "model"
+    created: int = 0
+    owned_by: str = "google"
+
+
+class ModelsResponse(BaseModel):
+    object: str = "list"
+    data: list[ModelInfo]
 
 
 # Global client
@@ -99,6 +121,23 @@ async def startup_event():
     await init_gemini_client()
 
 
+@app.get("/v1/models")
+async def list_models(http_request: Request):
+    # 验证 API key
+    verify_api_key(http_request)
+
+    models = [
+        ModelInfo(id="gemini-3.0-pro"),
+        ModelInfo(id="gemini-2.5-pro"),
+        ModelInfo(id="gemini-2.5-flash"),
+        ModelInfo(id="gpt-4"),
+        ModelInfo(id="gpt-4-turbo"),
+        ModelInfo(id="gpt-3.5-turbo"),
+        ModelInfo(id="gpt-3.5-turbo-16k"),
+    ]
+    return ModelsResponse(data=models)
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request_data: ChatCompletionRequest, http_request: Request):
     # 验证 API key
@@ -111,27 +150,93 @@ async def create_chat_completion(request_data: ChatCompletionRequest, http_reque
         )
 
     # For simplicity, concatenate all user messages as prompt
-    prompt = "\n".join([msg.content for msg in request_data.messages])
+    def extract_content(msg):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content
+        elif isinstance(content, list):
+            # Handle multimodal content, extract text parts
+            texts = []
+            for part in content:
+                if isinstance(part, str):
+                    texts.append(part)
+                elif isinstance(part, dict) and "text" in part:
+                    texts.append(part["text"])
+            return " ".join(texts)
+        else:
+            return str(content)
+
+    prompt = "\n".join([extract_content(msg) for msg in request_data.messages])
 
     # Handle streaming
     if request_data.stream:
-        import json
-        from fastapi.responses import StreamingResponse
+        # Map model names, default to gemini-3.0-pro if not recognized
+        model_map = {
+            "gemini-3.0-pro": "gemini-3.0-pro",
+            "gemini-2.5-pro": "gemini-2.5-pro",
+            "gemini-2.5-flash": "gemini-2.5-flash",
+            "gpt-4": "gemini-3.0-pro",
+            "gpt-4-turbo": "gemini-3.0-pro",
+            "gpt-3.5-turbo": "gemini-2.5-flash",
+            "gpt-3.5-turbo-16k": "gemini-2.5-pro",
+        }
+        gemini_model = model_map.get(request_data.model, "gemini-3.0-pro")
 
         async def generate_stream():
+            chunk_id = f"chatcmpl-{int(time.time())}"
+            created = int(time.time())
             try:
                 response = await client.generate_content(
-                    prompt, model=model_map.get(request_data.model, "gemini-3.0-pro")
+                    prompt, model=gemini_model
                 )
                 content = response.text
-                # Send the full content as one chunk for simplicity
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': content}, 'finish_reason': None}]}})}\n\n"
-                yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+
+                # First chunk with role
+                chunk1 = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request_data.model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk1)}\n\n"
+
+                # Content chunk
+                chunk2 = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request_data.model,
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk2)}\n\n"
+
+                # Final chunk with finish_reason
+                chunk3 = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request_data.model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(chunk3)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                error_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request_data.model,
+                    "choices": [{"index": 0, "delta": {"content": f"Error: {str(e)}"}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
 
-        return StreamingResponse(generate_stream(), media_type="text/plain")
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        )
 
     try:
         # Map model names, default to gemini-3.0-pro if not recognized
@@ -151,6 +256,8 @@ async def create_chat_completion(request_data: ChatCompletionRequest, http_reque
         )
 
         return ChatCompletionResponse(
+            id=f"chatcmpl-{int(time.time())}",
+            created=int(time.time()),
             model=request_data.model,
             choices=[
                 ChatCompletionChoice(
